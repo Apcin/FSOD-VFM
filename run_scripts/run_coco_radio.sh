@@ -1,0 +1,14 @@
+CUDA_VISIBLE_DEVICES=0 python ./main.py \
+--json_path ./data/coco/few_shot_10shot_seed33.json \
+--test_json ./data/coco/annotations/instances_val2017.json \
+--test_img_dir ./dataset/coco/val2017 \
+--data_dir ./dataset \
+--target_categories person bicycle car motorcycle airplane bus train boat bird cat dog horse sheep cow bottle chair couch "potted plant" "dining table" tv \
+--filter_by_categories \
+--feat_extractor_name RADIO \
+--radio_model_version c-radio_v4-h \
+--radio_cache_root ./model_cache \
+--min_threshold 0.01 \
+--diffusion_steps 30 \
+--alp 0.3 \
+--lamb 0.5 
