@@ -8,8 +8,56 @@ import model.radio
 import support_util
 import query_util
 import metric
+import race_metric
 import os
+import hashlib
 from chatrex.upn import UPNWrapper
+
+
+def _file_identity(path):
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        return {'path': path, 'exists': False}
+    stat = os.stat(path)
+    return {
+        'path': path,
+        'exists': True,
+        'size': stat.st_size,
+        'mtime_ns': stat.st_mtime_ns,
+    }
+
+
+def _build_support_cache_paths(args):
+    _, sam2_checkpoint = model.sam2.get_sam2_model_cfg_and_ckpt_path(
+        args.sam2_model_type
+    )
+    metadata = {
+        'cache_version': 1,
+        'feature_extractor': args.feat_extractor_name,
+        'model_version': args.model_version,
+        'radio_model_version': args.radio_model_version,
+        'dinov2_image_size': args.dinov2_image_size,
+        'sam2_model_type': args.sam2_model_type,
+        'dinov2_checkpoint': _file_identity(args.pretrained),
+        'sam2_checkpoint': _file_identity(sam2_checkpoint),
+    }
+    config_hash = hashlib.sha256(
+        json.dumps(metadata, sort_keys=True).encode('utf-8')
+    ).hexdigest()
+    with open(args.json_path, 'rb') as file:
+        support_hash = hashlib.sha256(file.read()).hexdigest()
+    support_name = os.path.splitext(os.path.basename(args.json_path))[0]
+    instance_cache_path = os.path.join(
+        args.support_feature_cache_dir,
+        f"support_instances_{config_hash[:16]}.pt",
+    )
+    prototype_cache_path = os.path.join(
+        args.prototype_cache_dir,
+        f"{support_name}_{support_hash[:16]}_{config_hash[:16]}.pt",
+    )
+    metadata['support_json'] = os.path.abspath(args.json_path)
+    metadata['support_hash'] = support_hash
+    return metadata, instance_cache_path, prototype_cache_path
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Few-shot VOC evaluation with DINOv2 + SAM2")
@@ -104,6 +152,32 @@ def parse_args():
     parser.add_argument('--lamb', type=float, 
                         help='lamda for decay')
 
+    parser.add_argument('--race_eval', action='store_true',
+                        help='evaluate predictions with competition protocol V1.5')
+    parser.add_argument('--race_score_threshold', type=float, default=None,
+                        help='optional score threshold for competition evaluation')
+    parser.add_argument('--race_eval_output_dir', type=str, default='./results',
+                        help='directory for competition evaluation summaries')
+    parser.add_argument('--skip_coco_eval', action='store_true',
+                        help='save predictions without running the original COCOeval')
+
+    parser.add_argument('--prototype_cache_dir', type=str,
+                        default='./cache/prototypes',
+                        help='directory for final class prototype caches')
+    parser.add_argument('--support_feature_cache_dir', type=str,
+                        default='./cache/support_features',
+                        help='directory for reusable support instance features')
+    parser.add_argument('--disable_prototype_cache', action='store_true',
+                        help='do not load or save final prototype caches')
+    parser.add_argument('--disable_support_feature_cache', action='store_true',
+                        help='do not load or save support instance features')
+    parser.add_argument('--rebuild_prototype_cache', action='store_true',
+                        help='recompute final prototypes (instance cache may still be reused)')
+    parser.add_argument('--rebuild_support_feature_cache', action='store_true',
+                        help='recompute support instance features and final prototypes')
+    parser.add_argument('--support_box_batch_size', type=int, default=64,
+                        help='number of support boxes processed together by SAM2')
+
     return parser.parse_args()
 
 def main():
@@ -173,18 +247,58 @@ def main():
     for cls, instances in support_data.items():
         print(f"Class: {cls}, #Instances: {len(instances)}")
 
-    # Build memory bank
-    memory_bank = support_util.extract_support_features(
-        support_data,
-        sam2_predictor,
-        args.feat_extractor_name,
-        feat_extractor,
-        image_transform,
-        args.data_dir,
-        args.device
+    cache_metadata, instance_cache_path, prototype_cache_path = (
+        _build_support_cache_paths(args)
+    )
+    use_prototype_cache = not args.disable_prototype_cache
+    use_instance_cache = not args.disable_support_feature_cache
+    force_prototype_rebuild = (
+        args.rebuild_prototype_cache or args.rebuild_support_feature_cache
     )
 
-    proto_feat, proto_cls = support_util.compute_prototype_weights(memory_bank, args.device)
+    if (
+        use_prototype_cache
+        and not force_prototype_rebuild
+        and os.path.exists(prototype_cache_path)
+    ):
+        prototype_cache = torch.load(
+            prototype_cache_path, map_location='cpu', weights_only=False
+        )
+        proto_feat = prototype_cache['proto_feat'].to(args.device)
+        proto_cls = prototype_cache['proto_cls']
+        print(f"Loaded prototype cache: {prototype_cache_path}")
+    else:
+        # Build the memory bank. Multiple boxes from the same image reuse one
+        # DINO/RADIO feature map and one SAM2 image embedding.
+        memory_bank = support_util.extract_support_features(
+            support_data,
+            sam2_predictor,
+            args.feat_extractor_name,
+            feat_extractor,
+            image_transform,
+            args.data_dir,
+            args.device,
+            instance_cache_path=(instance_cache_path if use_instance_cache else None),
+            rebuild_instance_cache=args.rebuild_support_feature_cache,
+            cache_metadata=cache_metadata,
+            support_box_batch_size=args.support_box_batch_size,
+        )
+        proto_feat, proto_cls = support_util.compute_prototype_weights(
+            memory_bank, args.device
+        )
+        if use_prototype_cache:
+            os.makedirs(args.prototype_cache_dir, exist_ok=True)
+            temp_cache_path = f"{prototype_cache_path}.tmp"
+            torch.save(
+                {
+                    'metadata': cache_metadata,
+                    'proto_feat': proto_feat.detach().cpu(),
+                    'proto_cls': proto_cls,
+                },
+                temp_cache_path,
+            )
+            os.replace(temp_cache_path, prototype_cache_path)
+            print(f"Saved prototype cache: {prototype_cache_path}")
     min_th = 0.01
     
     # Load VOC2007 test loader
@@ -212,10 +326,22 @@ def main():
         args.min_threshold,
     )
 
-    # Evaluate results
-    metric.run_coco_eval(args.test_json, results, args.pred_json,target_categories=args.target_categories,filter_by_categories=args.filter_by_categories)
+    # Save predictions and optionally run the original COCO evaluation.
+    if args.skip_coco_eval:
+        metric.save_coco_predictions(results, args.pred_json)
+        print(f"Predictions saved to: {args.pred_json}")
+    else:
+        metric.run_coco_eval(args.test_json, results, args.pred_json,target_categories=args.target_categories,filter_by_categories=args.filter_by_categories)
+
+    if args.race_eval:
+        race_metric.run_race_eval(
+            gt_json_path=args.test_json,
+            prediction_results=results,
+            pred_json_path=args.pred_json,
+            score_threshold=args.race_score_threshold,
+            output_dir=args.race_eval_output_dir,
+        )
 
 
 if __name__ == '__main__':
     main()
-

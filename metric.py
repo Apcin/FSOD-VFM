@@ -135,6 +135,7 @@ def generate_coco_style_predictions_upn(coco_style_loader,
     name_to_id = {v: k for k, v in id_to_name.items()}
     batch_size = 32  # Process N boxes at a time in SAM2
     results = []
+    inference_times = []
     if feat_extractor_name == 'DINOV2':
         extractor = support_util.get_dinov2_features
     elif feat_extractor_name == 'RADIO':
@@ -159,11 +160,18 @@ def generate_coco_style_predictions_upn(coco_style_loader,
             print(f"[Warning] Failed to load image {img_path}: {e}")
             continue
 
+        if torch.cuda.is_available() and str(device).startswith('cuda'):
+            torch.cuda.synchronize()
+        inference_start = time.perf_counter()
+
         proposals = upn.inference(img_pil, candid_prompt[1])
         proposals_coarse = upn.filter(proposals, min_score=0.01, nms_value=1)
         
         # chek proposals
         if proposals is None or len(proposals.get('original_xyxy_boxes', [])) == 0:
+            if torch.cuda.is_available() and str(device).startswith('cuda'):
+                torch.cuda.synchronize()
+            inference_times.append(time.perf_counter() - inference_start)
             continue
 
         else:
@@ -337,12 +345,26 @@ def generate_coco_style_predictions_upn(coco_style_loader,
             top_100_img_results = img_results[:100]
             results.extend(top_100_img_results)
 
+        if torch.cuda.is_available() and str(device).startswith('cuda'):
+            torch.cuda.synchronize()
+        inference_times.append(time.perf_counter() - inference_start)
+
+    if inference_times:
+        # Exclude the first image as GPU warm-up when possible.
+        measured_times = inference_times[1:] if len(inference_times) > 1 else inference_times
+        average_time = float(np.mean(measured_times))
+        print("\n====== Query Inference Time Estimate ======")
+        print("Image loading, model/prototype loading and prototype building are excluded.")
+        print(f"Measured query images: {len(measured_times)} (first image used as warm-up)")
+        print(f"Average time per current validation tile: {average_time:.3f} s")
+        print(f"Estimated 10k sequential time (144 tiles): {average_time * 144:.2f} s")
+        print(f"Estimated 10k sequential time (169 tiles): {average_time * 169:.2f} s")
+        print("Note: this is a tile-count estimate, not a substitute for real 10k end-to-end timing.")
+
     return results
 
     
-def run_coco_eval(gt_json_path, prediction_results, pred_json='temp_predictions.json', 
-                   target_categories=None, filter_by_categories=True, save_results=True):
-
+def save_coco_predictions(prediction_results, pred_json='temp_predictions.json'):
     # remove key to save storage and convert numpy arrays to lists
     for result in prediction_results:
         if 'feat' in result:
@@ -359,6 +381,14 @@ def run_coco_eval(gt_json_path, prediction_results, pred_json='temp_predictions.
     # Save prediction results to file
     with open(pred_json, 'w') as f:
         json.dump(prediction_results, f)
+
+    return prediction_results
+
+
+def run_coco_eval(gt_json_path, prediction_results, pred_json='temp_predictions.json', 
+                   target_categories=None, filter_by_categories=True, save_results=True):
+
+    save_coco_predictions(prediction_results, pred_json)
 
     # Load ground truth
     coco_gt = pycocotools.coco.COCO(gt_json_path)
@@ -443,7 +473,7 @@ def run_coco_eval(gt_json_path, prediction_results, pred_json='temp_predictions.
             'timestamp': timestamp,
             'gt_json_path': gt_json_path,
             'pred_json': pred_json,
-            'target_categories': target_categories,
+            'target_categories': target_categories if filter_by_categories else None,
             'filter_by_categories': filter_by_categories,
             'evaluation_results': eval_results,
             'stats_description': {
@@ -453,9 +483,9 @@ def run_coco_eval(gt_json_path, prediction_results, pred_json='temp_predictions.
                 'APs': 'Average Precision for small objects',
                 'APm': 'Average Precision for medium objects',
                 'APl': 'Average Precision for large objects',
-                'AR': 'Average Recall',
-                'AR50': 'Average Recall at IoU=0.50',
-                'AR75': 'Average Recall at IoU=0.75',
+                'AR@1': 'Average Recall with maxDets=1',
+                'AR@10': 'Average Recall with maxDets=10',
+                'AR@100': 'Average Recall with maxDets=100',
                 'ARs': 'Average Recall for small objects',
                 'ARm': 'Average Recall for medium objects',
                 'ARl': 'Average Recall for large objects'
@@ -477,7 +507,7 @@ def run_coco_eval(gt_json_path, prediction_results, pred_json='temp_predictions.
             'timestamp': timestamp,
             'gt_json_path': gt_json_path,
             'pred_json': pred_json,
-            'target_categories': target_categories,
+            'target_categories': target_categories if filter_by_categories else None,
             'summary_stats': {}
         }
         
@@ -490,9 +520,9 @@ def run_coco_eval(gt_json_path, prediction_results, pred_json='temp_predictions.
                 'APs': float(stats[3]),
                 'APm': float(stats[4]),
                 'APl': float(stats[5]),
-                'AR': float(stats[6]),
-                'AR50': float(stats[7]),
-                'AR75': float(stats[8]),
+                'AR@1': float(stats[6]),
+                'AR@10': float(stats[7]),
+                'AR@100': float(stats[8]),
                 'ARs': float(stats[9]),
                 'ARm': float(stats[10]),
                 'ARl': float(stats[11])
